@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -87,7 +89,16 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	} else {
 		log.Println("Unknown extension!")
 	}
-	filename := fmt.Sprintf("%v.%v", videoID.String(), ext)
+
+	
+	tnIDBytes := make([]byte, 32)
+	if _, err := rand.Read(tnIDBytes); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Can't get filename", err)
+		return
+	}
+	tnID := base64.RawURLEncoding.EncodeToString(tnIDBytes)
+
+	filename := fmt.Sprintf("%v.%v", tnID, ext)
 	path := filepath.Join(cfg.assetsRoot, filename)
 
 	file, err := os.Create(path)
