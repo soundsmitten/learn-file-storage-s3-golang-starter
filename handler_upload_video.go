@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
-	"path/filepath"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -65,28 +69,40 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	tmp, err := os.CreateTemp(os.TempDir(), "tubely-upload.mp4")
+	tmp, err := os.CreateTemp("", "tubely-upload.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "couldn't create tmp file", err)
 		return
 	}
-
-	defer func() {
-		_ = tmp.Close()
-
-		path := filepath.Join(os.TempDir(), "tubely-upload.mp4")
-		_ = os.Remove(path)
-	}()
 
 	if _, err := io.Copy(tmp, file); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "couldn't copy uploaded file", err)
 		return
 	}
 
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Error resetting seek head", err)
+	aspectRatio, err := getVideoAspectRatio(tmp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error processing video", err)
 		return
 	}
+
+	fastStartTmp, err := processVideoForFastStart(tmp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error processing fast start for video", err)
+		return
+	}
+
+	fastStartFile, err := os.Open(fastStartTmp)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error opening file", err)
+		return
+	}
+
+	defer os.Remove(fastStartTmp)
+	defer fastStartFile.Close()
+
+	tmp.Close()
+	os.Remove(tmp.Name())
 
 	idData := make([]byte, 32)
 	if _, err := rand.Read(idData); err != nil {
@@ -94,12 +110,23 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	objectID := base64.RawURLEncoding.EncodeToString(idData)
-	key := fmt.Sprint(objectID, ".mp4")
+
+	var keyPrefix string
+	switch aspectRatio {
+	case "16:9":
+		keyPrefix = "landscape"
+	case "9:16":
+		keyPrefix = "portrait"
+	default:
+		keyPrefix = "other"
+	}
+
+	key := fmt.Sprint(keyPrefix, "/", objectID, ".mp4")
 
 	if _, err := cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &key,
-		Body:        tmp,
+		Body:        fastStartFile,
 		ContentType: &mediaType,
 	}); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "couldn't upload file", err)
@@ -115,4 +142,76 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	type FFProbeOutput struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var buffer bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("ffprobe error: %v", err)
+		fmt.Printf("std err: %s\n", stderr.String())
+		return "", err
+	}
+
+	var output FFProbeOutput
+	if err := json.Unmarshal(buffer.Bytes(), &output); err != nil {
+		fmt.Println(err)
+		return "", err
+	}
+
+	if len(output.Streams) == 0 {
+		fmt.Println("no streams")
+		return "", errors.New("no streams in ffprobe response")
+	}
+
+	width := float64(output.Streams[0].Width)
+	height := float64(output.Streams[0].Height)
+	ratio := width / height
+	landscape := 16.0 / 9.0
+	portrait := 9.0 / 16.0
+	tolerance := 0.1
+
+	var aspectRatio string
+	if math.Abs(ratio-landscape) < tolerance {
+		aspectRatio = "16:9"
+	} else if math.Abs(ratio-portrait) < tolerance {
+		aspectRatio = "9:16"
+	} else {
+		aspectRatio = "other"
+	}
+
+	return aspectRatio, nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputPath := fmt.Sprint(filePath, ".processing")
+	cmd := exec.Command(
+		"ffmpeg",
+		"-i",
+		filePath,
+		"-c",
+		"copy",
+		"-movflags",
+		"faststart",
+		"-f",
+		"mp4",
+		outputPath,
+	)
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	return outputPath, nil
 }
